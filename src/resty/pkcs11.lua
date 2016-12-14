@@ -1,176 +1,156 @@
-local ffi        = require "ffi"
-local ffi_new    = ffi.new
-local ffi_gc = ffi.gc
-local ffi_typeof = ffi.typeof
-local ffi_cdef   = ffi.cdef
-local ffi_load   = ffi.load
-local ffi_str    = ffi.string
-local C          = ffi.C
-local tonumber   = tonumber
-local setmetatable = setmetatable
-local error = error
+local ffi = require("ffi")
+
+ffi.cdef[[ 
+  typedef void*             CK_VOID_PTR;
+
+  typedef unsigned long int CK_ULONG;
+  
+  typedef CK_ULONG          CK_RV;
+  typedef CK_ULONG          CK_SLOT_ID;
+  typedef CK_ULONG          CK_FLAGS;
+  typedef CK_ULONG          CK_SESSION_HANDLE;
+  typedef CK_SESSION_HANDLE * CK_SESSION_HANDLE_PTR;
+  typedef CK_ULONG          CK_NOTIFICATION;
+
+  typedef CK_RV (* CK_NOTIFY)(
+      CK_SESSION_HANDLE hSession,   
+      CK_NOTIFICATION   event,
+      CK_VOID_PTR       pApplication 
+  );
+
+  CK_RV C_Initialize (CK_VOID_PTR   pInitArgs);  
+  CK_RV C_Finalize (CK_VOID_PTR   pReserved);  
+
+  CK_RV C_OpenSession ( 
+      CK_SLOT_ID slotID, 
+      CK_FLAGS flags, 
+      CK_VOID_PTR pApplication, 
+      CK_NOTIFY Notify,
+      CK_SESSION_HANDLE_PTR phSession
+  );
+
+  CK_RV C_CloseSession (
+      CK_SESSION_HANDLE hSession
+  );
+
+]]
 
 
-local _M = { _VERSION = '0.01' }
+local CKR_OK                            = 0x00000000
+local CKR_HOST_MEMORY                   = 0x00000002
+local CKR_GENERAL_ERROR                 = 0x00000005
+local CKR_FUNCTION_FAILED               = 0x00000006
+local CKR_ARGUMENTS_BAD                 = 0x00000007
+local CKR_NEED_TO_CREATE_THREADS        = 0x00000009
+local CKR_CANT_LOCK                     = 0x0000000A
+local CKR_CRYPTOKI_ALREADY_INITIALIZED  = 0x00000191
 
+local RV_ERR_MSG = {}
+RV_ERR_MSG[ CKR_HOST_MEMORY ] = "HSM driver memory allocation error"
+RV_ERR_MSG[ CKR_GENERAL_ERROR ] = "HSM General error"
+RV_ERR_MSG[ CKR_FUNCTION_FAILED ] = "HSM processing failed" 
+RV_ERR_MSG[ CKR_ARGUMENTS_BAD ] = "Bad arguments provided"
+RV_ERR_MSG[ CKR_NEED_TO_CREATE_THREADS ] = "Need to create threads"
+RV_ERR_MSG[ CKR_CANT_LOCK ] = "Driver unable to create mutex" 
+RV_ERR_MSG[ CKR_CRYPTOKI_ALREADY_INITIALIZED ] = "HSM module already initialized"
+
+
+
+local function err_out ( ckr , err_prefix )
+  local err_string = RV_ERR_MSG[ckr] or ( "Unknown error: " .. ckr) 
+  return false, err_prefix .. err_string  
+end
+
+
+
+local _M = {
+  _VERSION = '0.01'
+}
 local mt = { __index = _M }
 
-ffi_cdef [[
-
-unsigned long ERR_get_error(void);
-const char * ERR_reason_error_string(unsigned long e);
-
-typedef struct PKCS11_key_st {
-	char *label;
-	unsigned char *id;
-	size_t id_len;
-	unsigned char isPrivate;	/**< private key present? */
-	unsigned char needLogin;	/**< login to read private key? */
-	EVP_PKEY *evp_key;		/**< initially NULL, need to call PKCS11_load_key */
-	void *_private;
-} PKCS11_KEY;
-
-typedef struct PKCS11_cert_st {
-	char *label;
-	unsigned char *id;
-	size_t id_len;
-	X509 *x509;
-	void *_private;
-} PKCS11_CERT;
-
-typedef struct PKCS11_token_st {
-	char *label;
-	char *manufacturer;
-	char *model;
-	char *serialnr;
-	unsigned char initialized;
-	unsigned char loginRequired;
-	unsigned char secureLogin;
-	unsigned char userPinSet;
-	unsigned char readOnly;
-	unsigned char hasRng;
-	unsigned char userPinCountLow;
-	unsigned char userPinFinalTry;
-	unsigned char userPinLocked;
-	unsigned char userPinToBeChanged;
-	unsigned char soPinCountLow;
-	unsigned char soPinFinalTry;
-	unsigned char soPinLocked;
-	unsigned char soPinToBeChanged;
-	void *_private;
-} PKCS11_TOKEN;
-
-typedef struct PKCS11_slot_st {
-	char *manufacturer;
-	char *description;
-	unsigned char removable;
-	PKCS11_TOKEN *token;	/**< NULL if no token present */
-	void *_private;
-} PKCS11_SLOT;
-
-typedef struct PKCS11_ctx_st {
-	char *manufacturer;
-	char *description;
-	void *_private;
-} PKCS11_CTX;
-
-extern PKCS11_CTX* PKCS11_CTX_new(void);
-extern void PKCS11_CTX_free(PKCS11_CTX * ctx);
-extern int PKCS11_CTX_load(PKCS11_CTX * ctx, const char * ident);
-extern int PKCS11_CTX_reload(PKCS11_CTX * ctx);
-extern int PKCS11_open_session(PKCS11_SLOT * slot, int rw);
-extern int PKCS11_enumerate_slots(PKCS11_CTX * ctx, PKCS11_SLOT **slotsp, unsigned int *nslotsp);
-extern unsigned long PKCS11_get_slotid_from_slot(PKCS11_SLOT *slotp);
-extern void PKCS11_release_all_slots(PKCS11_CTX * ctx, PKCS11_SLOT *slots, unsigned int nslots);
-extern int PKCS11_enumerate_slots(PKCS11_CTX * ctx, PKCS11_SLOT **slotsp, unsigned int *nslotsp);
-PKCS11_SLOT *PKCS11_find_token(PKCS11_CTX * ctx, PKCS11_SLOT *slots, unsigned int nslots);
-extern int PKCS11_login(PKCS11_SLOT * slot, int so, const char *pin);
-]]
-
-local lib = ffi_load ("/opt/capione/lualib/p11.so")
-local char_t = ffi_typeof "char[?]"
-local size_t = ffi_typeof "size_t[1]"
-local uint_ptr = ffi.typeof"unsigned int[1]"
-local ctx_ptr_type = ffi.typeof("PKCS11_CTX[1]")
-local pkcs_slot_ptr_type = ffi.typeof("PKCS11_SLOT[1]");
-
-local function _err()
-    local code = _C.ERR_get_error()
-    if code == 0 then
-        return code, "Zero error code (null arguments?)"
-    end
-    return code, ffi.string(_C.ERR_reason_error_string(code))
-end
+_M.CKF_SERIAL_SESSION = 0x00000004
 
 
-function _M.new(self, pkcsmodule)
-    
-    local ctx = lib.PKCS11_CTX_new()
 
-    local r = lib.PKCS11_CTX_load(ctx, pkcsmodule)
-    
-    if r ~= 0 then
-      ffi_gc(ctx, lib.PKCS11_CTX_free)
-      return nil, _err()
-     end
-    ffi_gc(ctx, lib.PKCS11_CTX_free)
-    return setmetatable({ _ctx = ctx }, mt)
-end
+_M.init = function ( options ) 
 
-function _M.enumerate_slots(self)
-  local nslots = uint_ptr()
-  local slots = ffi.new("PKCS11_SLOT *[1]")
-  local rc = lib.PKCS11_enumerate_slots(self._ctx, slots, nslots)
-  if rc < 0 then
-     return nil, _err()
-  end
-  print(nslots[0] .. ":")
+  local driver_library = options['driver'] 
   
+  if not driver_library or  #driver_library == 0 then 
+    return false, "Missing HSM driver"
+  end
+  
+  local driver = ffi.load(driver_library)
 
-  local slot = lib.PKCS11_find_token(self._ctx, slots[0], nslots[0])
+  if not driver then 
+    return false, "Unable to load HSM driver : " .. driver_library
+  end
+
+  local ckr = driver.C_Initialize(nil)
+  
+  if not ckr or ckr ~= CKR_OK then
+    return err_out (ckr, "Unable to initilize HSM module: ")
+  end
+
+  _M.driver = driver
+  return true
+end
+
+
+_M.close = function () 
+  if not _M.driver then return true end
+
+  local ckr = _M.driver.C_Finalize(nil)
+   _M.driver = nil
+
+  if not ckr or ckr ~= CKR_OK then
+    return err_out (ckr, "Unable to close HSM module: ")
+  end
+  return true
+end
+
+_M.close_session = function(self)
+  self.close = _M.close
+  if not _M.driver then
+    return nil, "Module not initialized"
+  end
+
+  if not self._sessionPtr then
+    return false, "Not valid session"
+  end
+  
+  local ckr = _M.driver.C_CloseSession(self._sessionHandle)
    
-  if not slot[0] then
-    print("slot not found")
-    lib.PKCS11_release_all_slots(self._ctx, slots[0], nslots[0])
-    return nil, 0,  "no token available"
-  end
-   print("slot found")
-  if not slot[0].token then
-    print("slot token not found")
-    lib.PKCS11_release_all_slots(self._ctx, slots[0], nslots[0])
-    return nil, 0,  "no token available"
-  end
-  
- 
-  print("Slot manufacturer......: %s\n", ffi.string(slot.manufacturer))
-	print("Slot description.......: %s\n", ffi.string(slot.description))
-	print("Slot token label.......: %s\n", ffi.string(slot.token.label))
-	print("Slot token manufacturer: %s\n", ffi.string(slot.token.manufacturer))
-	print("Slot token model.......: %s\n", ffi.string(slot.token.model))
-	print("Slot token serialnr....: %s\n", ffi.string(slot.token.serialnr))
-  
-  if slot.token.loginRequired == 1 then
-    print("login required...")
-   local rc = lib.PKCS11_login(slot, 0, "1234")
-   if rc ~= 0 then
-     print("Login failed")
-     return nil, 0, "login failed"
-   end
-   print("Login success")
-  end
-  lib.PKCS11_release_all_slots(self._ctx, slots[0], nslots[0]);
+  self._sessionPtr = nil
+  self._sessionHandle = nil
 
+  if not ckr or ckr ~= CKR_OK then
+    return err_out(ckr, "Failed to close session: ")
+  end
+
+  return true
 end
 
---[[usage
-local softhsm = "/usr/local/lib/softhsm/libsofthsm.so"
-  local p11 = pkcs11:new(softhsm)
-  if not p11 then
-    log_msg(log.ERROR,  "Failed to load :" , softhsm)
-    return
+_M.new_session = function (slotId, flags, application, notificationCallback)
+  if not _M.driver then
+    return nil, "Module not initialized"
   end
-  
-  local ok, code, msg = p11:enumerate_slots()
-]]
+
+  if not flags then flags = _M.CKF_SERIAL_SESSION end
+
+  local sessionHandlePtr = ffi.new('CK_SESSION_HANDLE[1]')
+
+  local ckr = _M.driver.C_OpenSession(slotId, flags, application, notificationCallback, sessionHandlePtr)
+  if not ckr or ckr ~= CKR_OK then
+    return err_out(ckr, "Unable to open session: ")
+  end
+
+  return setmetatable ({
+    _sessionPtr = sessionHandlePtr,
+    _sessionHandle = sessionHandlePtr[0],
+    close = _M.close_session
+  }, mt)
+
+end
 
 return _M
