@@ -22,6 +22,14 @@ else
   print ("Login succesfull")
 end
 
+
+local key_ptr, err = hsmSession:find_key("12345678")
+if not key_ptr then
+  print (err)
+else
+  print ("I have a key")
+end
+
 ok, err = hsmSession:logout()
 if not ok then 
   print (err)
