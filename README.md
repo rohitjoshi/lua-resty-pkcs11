@@ -15,10 +15,10 @@ For PKCS#11 API details see details see : [PKCS#11 standard](https://emea.emc.co
 openssl genpkey -algorithm RSA -out private_key.pem -pkeyopt rsa_keygen_bits:2048 
 ```
 
-3. Use softhsm2-util to setup slot and upload key
+3. Use softhsm2-util to setup slot and upload key. Use "1234" for all PINs.
 ```  
-softhsm2-util --init-token --slot 899348241 --label "Test 1 token" 
-softhsm2-util --import ./private_key.pem --slot 899348241 --id "12345678" --label "my test key"
+softhsm2-util --init-token --label "my_token" --slot 0 
+softhsm2-util --import ./private_key.pem --token my_token --label my_key_pair --id 01020304
 ```
 
 4. Check status 
@@ -26,7 +26,9 @@ softhsm2-util --import ./private_key.pem --slot 899348241 --id "12345678" --labe
 softhsm2-util --show-slots
 ```
 
-4. In src/resty directory run test script :
+5. Update the pkcs11_test.lua to open correct slot. 
+
+6. In src/resty directory run test script :
 ``` 
 luajit pkcs11_test.lua 
 ```
@@ -37,7 +39,7 @@ local hsm_module = require('pkcs11')
 
 -- init module with softhsm driver 
 local ok, err = hsm_module.init({
-    driver = "/usr/local/Cellar/openssl/1.0.2j/lib/engines/libsofthsm2.so"
+    driver = "/usr/local/lib/softhsm/libsofthsm2.so"
 });
 
 -- open session with slot ID 899348241
@@ -47,9 +49,8 @@ local hsmSession, err = hsm_module.new_session(0x359af711)
 ok, err = hsmSession:login("1234", hsm_module.CKU_USER)
 
 -- get your encryption key identified by ID
-key_ptr, err = hsmSession:find_key("12345678")
+key_ptr, err = hsmSession:find_public_key_by_id("\x01\x02\x03\x04")
 
--- TODO : use the key for crypto operations 
 
 -- make clean up 
 ok, err = hsmSession:logout()
