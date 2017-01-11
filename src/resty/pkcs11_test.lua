@@ -86,7 +86,7 @@ else
     print (err) 
   end
   
-  print ("I've signed plain data")
+  print ("I've signed plain data : ")
 
 
   key_ptr, err = hsmSession:find_public_key_by_id("\x01\x02\x03\x04")
@@ -95,7 +95,7 @@ else
   else
     print ("I have a key")
 
-    ok, err = hsmSession:verify_init(hsm_module.CKM_RSA_PKCS, key_ptr)
+    ok, err = hsmSession:verify_init(hsm_module.CKM_RSA_X_509, key_ptr)
     if not ok then 
       print (err)
     else

@@ -1,4 +1,9 @@
 local ffi = require("ffi")
+local ffi_new = ffi.new
+local ffi_cast = ffi.cast
+local ffi_sizeof = ffi.sizeof
+local ffi_string = ffi.string
+local ffi_load = ffi.load
 
 ffi.cdef[[ 
   typedef unsigned char     CK_BYTE;
@@ -759,6 +764,124 @@ _M.CKM_X9_42_DH_PARAMETER_GEN = 0x00002002
 _M.CKM_VENDOR_DEFINED = 0x80000000
 
 
+local find_a_key_by_id = function ( key_type )
+  return function (self, key_id)
+    
+    local ul_count = 2
+    local searchTemplatePtr = ffi_new ( 'CK_ATTRIBUTE[?]', ul_count )
+    local cast_key_id  = ffi_cast ('CK_VOID_PTR', key_id)
+
+    local class_type_ptr = ffi_new('CK_OBJECT_CLASS[1]') 
+    class_type_ptr[0] = key_type
+    searchTemplatePtr[0].type = _M.CKA_CLASS
+    searchTemplatePtr[0].pValue = class_type_ptr
+    searchTemplatePtr[0].ulValueLen = ffi_sizeof("CK_OBJECT_CLASS")
+
+    searchTemplatePtr[1].type = _M.CKA_ID
+    searchTemplatePtr[1].pValue = cast_key_id
+    searchTemplatePtr[1].ulValueLen = #key_id 
+
+    return self:find_object( searchTemplatePtr , ul_count)
+  end
+end
+
+local crypto_init = function (driver_function) 
+
+  return function (self, mechanism_type, h_key_ptr, mech_param, mech_param_size)
+    if not _M.driver then
+      return nil, "Module not initialized"
+    end
+
+    if not self or not self._sessionPtr then
+      return nil, "Not valid session"
+    end
+
+    local mechanismPtr = ffi_new ( 'CK_MECHANISM[1]' )
+    mechanismPtr[0].mechanism = mechanism_type
+    mechanismPtr[0].pParameter = mech_param
+    mechanismPtr[0].ulParameterLen = mech_param_size or 0
+
+    local ckr = driver_function(self._sessionHandle, mechanismPtr, h_key_ptr[0] )
+    if not ckr or ckr ~= CKR_OK then
+      return err_out(ckr, "Initialization failed: ")
+    end
+
+    return true
+    
+  end 
+end
+
+
+local crypto_in_out = function ( driver_function )
+  
+  return function (self, data) 
+    if not _M.driver then
+      return nil, "Module not initialized"
+    end
+
+    if not self or not self._sessionPtr then
+      return nil, "Not valid session"
+    end
+
+    local data_len = #data
+    local cast_data = ffi_cast ('CK_BYTE_PTR', data)
+
+    self._buffer_size[0] = _M.max_buffer_size
+
+    local ckr = driver_function(self._sessionHandle, cast_data, data_len, self._buffer, self._buffer_size)
+    if not ckr or ckr ~= CKR_OK then
+      return err_out(ckr, "Crypto operation failed: ")
+    end
+
+    return ffi_string(self._buffer, self._buffer_size[0]), self._buffer_size[0]
+  end
+end
+
+
+local crypto_out = function ( driver_function ) 
+  return function (self)
+    if not _M.driver then
+      return nil, "Module not initialized"
+    end
+
+    if not self or not self._sessionPtr then
+      return nil, "Not valid session"
+    end
+
+    self._buffer_size[0] = _M.max_buffer_size
+
+    local ckr = driver_function(self._sessionHandle, self._buffer, self._buffer_size)
+    if not ckr or ckr ~= CKR_OK then
+      return err_out(ckr, "Crypro operation failed: ")
+    end
+
+    return ffi_string(self._buffer, self._buffer_size[0]), self._buffer_size[0]  
+  end
+end
+
+
+local crypto_in  = function ( driver_function ) 
+  return function (self, data) 
+    if not _M.driver then
+      return nil, "Module not initialized"
+    end
+
+    if not self or not self._sessionPtr then
+      return nil, "Not valid session"
+    end
+
+    local data_len = #data
+    local cast_data = ffi_cast ('CK_BYTE_PTR', data)
+
+    local ckr = driver_function(self._sessionHandle, cast_data, data_len)
+    if not ckr or ckr ~= CKR_OK then
+      return err_out(ckr, "Crypro operation failed: ")
+    end
+
+    return true
+  end
+end
+
 
 _M.init = function ( options ) 
 
@@ -768,7 +891,7 @@ _M.init = function ( options )
     return false, "Missing HSM driver"
   end
   
-  local driver = ffi.load(driver_library)
+  local driver = ffi_load(driver_library)
 
   if not driver then 
     return false, "Unable to load HSM driver : " .. driver_library
@@ -780,7 +903,29 @@ _M.init = function ( options )
     return err_out (ckr, "Unable to initilize HSM module: ")
   end
 
+  _M.max_buffer_size = options.max_buffer_size or 2048 
   _M.driver = driver
+
+  _M.find_public_key_by_id =  find_a_key_by_id( _M.CKO_PUBLIC_KEY )
+  _M.find_private_key_by_id = find_a_key_by_id( _M.CKO_PRIVATE_KEY )
+  _M.find_secret_key_by_id = find_a_key_by_id( _M.CKO_SECRET_KEY )
+
+  _M.encrypt_init = crypto_init( _M.driver.C_EncryptInit )
+  _M.decrypt_init = crypto_init( _M.driver.C_DecryptInit )
+  _M.sign_init =  crypto_init( _M.driver.C_SignInit  )
+  _M.verify_init = crypto_init( _M.driver.C_VerifyInit)
+  
+  _M.encrypt = crypto_in_out ( _M.driver.C_Encrypt )
+  _M.encrypt_update =  crypto_in_out ( _M.driver.C_EncryptUpdate )
+  _M.decrypt =  crypto_in_out ( _M.driver.C_Decrypt )
+  _M.decrypt_update =  crypto_in_out (_M.driver.C_DecryptUpdate )
+  _M.sign =  crypto_in_out ( _M.driver.C_Sign )
+  _M.encrypt_final  = crypto_out ( _M.driver.C_EncryptFinal )
+  _M.decrypt_final =  crypto_out ( _M.driver.C_DecryptFinal )
+  _M.sign_final = crypto_out ( _M.driver.C_SignFinal )
+  _M.sign_update = crypto_in ( _M.driver.C_SignUpdate )
+  _M.verify_update = crypto_in ( _M.driver.C_VerifyUpdate )
+  
   return true
 end
 
@@ -835,6 +980,7 @@ _M.close_session = function(self)
   return true
 end
 
+
 _M.new_session = function (slot_id, flags, application, notificationCallback)
   if not _M.driver then
     return nil, "Module not initialized"
@@ -842,16 +988,22 @@ _M.new_session = function (slot_id, flags, application, notificationCallback)
 
   if not flags then flags = _M.CKF_SERIAL_SESSION end
 
-  local sessionHandlePtr = ffi.new('CK_SESSION_HANDLE[1]')
+  local sessionHandlePtr = ffi_new('CK_SESSION_HANDLE[1]')
 
   local ckr = _M.driver.C_OpenSession(slot_id, flags, application, notificationCallback, sessionHandlePtr)
   if not ckr or ckr ~= CKR_OK then
     return err_out(ckr, "Unable to open session: ")
   end
 
+  local out_buf = ffi_new("CK_BYTE[?]", _M.max_buffer_size)
+  local out_len = ffi_new("CK_ULONG[1]")
+  out_len[0] = _M.max_buffer_size
+
   return setmetatable ({
     _sessionPtr = sessionHandlePtr,
     _sessionHandle = sessionHandlePtr[0],
+    _buffer = out_buf,
+    _buffer_size = out_len,
     close = _M.close_session
   }, mt)
 
@@ -876,7 +1028,7 @@ _M.login = function ( self, pin , user_type )
     return false, "Invalid PIN"
   end
   
-  local cast_pin  = ffi.cast ('CK_UTF8CHAR_PTR', pin)
+  local cast_pin  = ffi_cast ('CK_UTF8CHAR_PTR', pin)
 
   local ckr = _M.driver.C_Login(self._sessionHandle, user_type, cast_pin, #pin)
   if not ckr or ckr ~= CKR_OK then
@@ -885,6 +1037,7 @@ _M.login = function ( self, pin , user_type )
 
   return true
 end
+
 
 _M.logout = function ( self ) 
   if not _M.driver then
@@ -901,45 +1054,6 @@ _M.logout = function ( self )
   end
 
   return true
-end
-
-_M.find_public_key_by_id = function (self, key_id)
-  local searchTemplatePtr = ffi.new ( 'CK_ATTRIBUTE[2]' )
-  local cast_key_id  = ffi.cast ('CK_VOID_PTR', key_id)
-
-  local class_type_ptr = ffi.new('CK_OBJECT_CLASS[1]') 
-  class_type_ptr[0] = _M.CKO_PUBLIC_KEY
-  searchTemplatePtr[0].type = _M.CKA_CLASS
-  searchTemplatePtr[0].pValue = class_type_ptr
-  searchTemplatePtr[0].ulValueLen = ffi.sizeof("CK_OBJECT_CLASS")
-
-
-  searchTemplatePtr[1].type = _M.CKA_ID
-  searchTemplatePtr[1].pValue = cast_key_id
-  searchTemplatePtr[1].ulValueLen = #key_id 
-
-  local ul_count = 2
-  return self:find_object( searchTemplatePtr , ul_count)
-end
-
-
-_M.find_private_key_by_id = function (self, key_id)
-  local searchTemplatePtr = ffi.new ( 'CK_ATTRIBUTE[2]' )
-  local cast_key_id  = ffi.cast ('CK_VOID_PTR', key_id)
-
-  local class_type_ptr = ffi.new('CK_OBJECT_CLASS[1]') 
-  class_type_ptr[0] = _M.CKO_PRIVATE_KEY
-  searchTemplatePtr[0].type = _M.CKA_CLASS
-  searchTemplatePtr[0].pValue = class_type_ptr
-  searchTemplatePtr[0].ulValueLen = ffi.sizeof("CK_OBJECT_CLASS")
-
-
-  searchTemplatePtr[1].type = _M.CKA_ID
-  searchTemplatePtr[1].pValue = cast_key_id
-  searchTemplatePtr[1].ulValueLen = #key_id 
-
-  local ul_count = 2
-  return self:find_object( searchTemplatePtr , ul_count)
 end
 
 
@@ -959,8 +1073,8 @@ _M.find_object = function (self, searchTemplatePtr, ul_count)
     return err_out(ckr, "Key search processing error: ")
   end
 
-  local object_ptr = ffi.new('CK_OBJECT_HANDLE[1]')
-  local number_of_returned_objects_ptr = ffi.new('CK_ULONG[1]')
+  local object_ptr = ffi_new('CK_OBJECT_HANDLE[1]')
+  local number_of_returned_objects_ptr = ffi_new('CK_ULONG[1]')
 
   ckr = _M.driver.C_FindObjects(self._sessionHandle, object_ptr, 1, number_of_returned_objects_ptr )
   if not ckr or ckr ~= CKR_OK then
@@ -977,326 +1091,6 @@ _M.find_object = function (self, searchTemplatePtr, ul_count)
   return object_ptr
 end
 
-_M.encrypt_init = function (self, mechanism_type, h_key_ptr, mech_param, mech_param_size) 
-
-  if not _M.driver then
-    return nil, "Module not initialized"
-  end
-
-  if not self or not self._sessionPtr then
-    return nil, "Not valid session"
-  end
-
-  local mechanismPtr = ffi.new ( 'CK_MECHANISM[1]' )
-  mechanismPtr[0].mechanism = mechanism_type
-  mechanismPtr[0].pParameter = mech_param
-  mechanismPtr[0].ulParameterLen = mech_param_size or 0
-
-  local ckr = _M.driver.C_EncryptInit(self._sessionHandle, mechanismPtr, h_key_ptr[0] )
-  if not ckr or ckr ~= CKR_OK then
-    return err_out(ckr, "Encryption initialization failed: ")
-  end
-
-  return true  
-end
-
-_M.encrypt = function (self, plain_data) 
-  if not _M.driver then
-    return nil, "Module not initialized"
-  end
-
-  if not self or not self._sessionPtr then
-    return nil, "Not valid session"
-  end
-
-  local plain_len = #plain_data
-  local cast_plain_data = ffi.cast ('CK_BYTE_PTR', plain_data)
-
-  local max_len = plain_len + 2048 
-  local out_buf = ffi.new("CK_BYTE[?]", max_len)
-  local out_len = ffi.new("CK_ULONG[1]")
-  out_len[0] = max_len
-
-  local ckr = _M.driver.C_Encrypt(self._sessionHandle, cast_plain_data, plain_len, out_buf, out_len)
-  if not ckr or ckr ~= CKR_OK then
-    return err_out(ckr, "Encryption failed: ")
-  end
-
-  return ffi.string(out_buf, out_len[0]), out_len
-
-end
-
-
-_M.encrypt_update = function (self, plain_data_part) 
-  if not _M.driver then
-    return nil, "Module not initialized"
-  end
-
-  if not self or not self._sessionPtr then
-    return nil, "Not valid session"
-  end
-
-  local plain_part_len = #plain_data_part
-  local cast_plain_data_part = ffi.cast ('CK_BYTE_PTR', plain_data_part)
-
-  local max_len = plain_part_len + 2048
-  local out_buf = ffi.new("CK_BYTE[?]", max_len)
-  local out_len = ffi.new("CK_ULONG[1]")
-  out_len[0] = max_len
-
-  local ckr = _M.driver.C_EncryptUpdate(self._sessionHandle, cast_plain_data_part, plain_part_len, out_buf, out_len)
-  if not ckr or ckr ~= CKR_OK then
-    return err_out(ckr, "Encryption update failed: ")
-  end
-
-  return ffi.string(out_buf, out_len[0]), out_len
-end
-
-
-_M.encrypt_final = function (self)
-  if not _M.driver then
-    return nil, "Module not initialized"
-  end
-
-  if not self or not self._sessionPtr then
-    return nil, "Not valid session"
-  end
-
-  local max_len = 2048
-  local out_buf = ffi.new("CK_BYTE[?]", max_len)
-  local out_len = ffi.new("CK_ULONG[1]")
-  out_len[0] = max_len
-
-
-  local ckr = _M.driver.C_EncryptFinal(self._sessionHandle, out_buf, out_len)
-  if not ckr or ckr ~= CKR_OK then
-    return err_out(ckr, "Encryption update failed: ")
-  end
-
-  return ffi.string(out_buf, out_len[0]), out_len  
-end
-
-
-_M.decrypt_init = function (self, mechanism_type, h_key_ptr, mech_param, mech_param_size) 
-
-  if not _M.driver then
-    return nil, "Module not initialized"
-  end
-
-  if not self or not self._sessionPtr then
-    return nil, "Not valid session"
-  end
-
-  local mechanismPtr = ffi.new ( 'CK_MECHANISM[1]' )
-  mechanismPtr[0].mechanism = mechanism_type
-  mechanismPtr[0].pParameter = mech_param
-  mechanismPtr[0].ulParameterLen = mech_param_size or 0
-
-  local ckr = _M.driver.C_DecryptInit(self._sessionHandle, mechanismPtr, h_key_ptr[0] )
-  if not ckr or ckr ~= CKR_OK then
-    return err_out(ckr, "Decryption initialization failed: ")
-  end
-
-  return true  
-end
-
-
-_M.decrypt = function (self, encrypted_data) 
-  if not _M.driver then
-    return nil, "Module not initialized"
-  end
-
-  if not self or not self._sessionPtr then
-    return nil, "Not valid session"
-  end
-
-  local encrypted_data_len = #encrypted_data
-  local cast_encrypted_data = ffi.cast ('CK_BYTE_PTR', encrypted_data)
-
-  local max_len = encrypted_data_len + 2048
-  local out_buf = ffi.new("CK_BYTE[?]", max_len)
-  local out_len = ffi.new("CK_ULONG[1]")
-  out_len[0] = max_len
-
-
-  local ckr = _M.driver.C_Decrypt(self._sessionHandle, cast_encrypted_data, encrypted_data_len, out_buf, out_len)
-  if not ckr or ckr ~= CKR_OK then
-    return err_out(ckr, "Decryption failed: ")
-  end
-
-  return ffi.string(out_buf, out_len[0]), out_len
-
-end
-
-
-_M.decrypt_update = function (self, encrypted_data) 
-  if not _M.driver then
-    return nil, "Module not initialized"
-  end
-
-  if not self or not self._sessionPtr then
-    return nil, "Not valid session"
-  end
-
-  local encrypted_data_len = #encrypted_data
-  local cast_encrypted_data = ffi.cast ('CK_BYTE_PTR', encrypted_data)
-
-  local max_len = encrypted_data_len + 2048
-  local out_buf = ffi.new("CK_BYTE[?]", max_len)
-  local out_len = ffi.new("CK_ULONG[1]")
-  out_len[0] = max_len
-
-
-  local ckr = _M.driver.C_DecryptUpdate(self._sessionHandle, cast_encrypted_data, encrypted_data_len, out_buf, out_len)
-  if not ckr or ckr ~= CKR_OK then
-    return err_out(ckr, "Decryption update failed: ")
-  end
-
-  return ffi.string(out_buf, out_len[0]), out_len
-
-end
-
-
-_M.decrypt_final = function (self) 
-  if not _M.driver then
-    return nil, "Module not initialized"
-  end
-
-  if not self or not self._sessionPtr then
-    return nil, "Not valid session"
-  end
-
-  local max_len = 2048
-  local out_buf = ffi.new("CK_BYTE[?]", max_len)
-  local out_len = ffi.new("CK_ULONG[1]")
-  out_len[0] = max_len
-
-
-  local ckr = _M.driver.C_DecryptFinal(self._sessionHandle, out_buf, out_len)
-  if not ckr or ckr ~= CKR_OK then
-    return err_out(ckr, "Decryption update failed: ")
-  end
-
-  return ffi.string(out_buf, out_len[0]), out_len
-
-end
-
-_M.sign_init = function (self, mechanism_type, h_key_ptr, mech_param, mech_param_size) 
-
-  if not _M.driver then
-    return nil, "Module not initialized"
-  end
-
-  if not self or not self._sessionPtr then
-    return nil, "Not valid session"
-  end
-
-  local mechanismPtr = ffi.new ( 'CK_MECHANISM[1]' )
-  mechanismPtr[0].mechanism = mechanism_type
-  mechanismPtr[0].pParameter = mech_param
-  mechanismPtr[0].ulParameterLen = mech_param_size or 0
-
-  local ckr = _M.driver.C_SignInit(self._sessionHandle, mechanismPtr, h_key_ptr[0] )
-  if not ckr or ckr ~= CKR_OK then
-    return err_out(ckr, "Signing initialization failed: ")
-  end
-
-  return true  
-end
-
-_M.sign = function (self, data_to_sign) 
-  if not _M.driver then
-    return nil, "Module not initialized"
-  end
-
-  if not self or not self._sessionPtr then
-    return nil, "Not valid session"
-  end
-
-  local data_to_sign_len = #data_to_sign
-  local cast_data_to_sign = ffi.cast ('CK_BYTE_PTR', data_to_sign)
-
-  local max_len = 2048 
-  local out_buf = ffi.new("CK_BYTE[?]", max_len)
-  local out_len = ffi.new("CK_ULONG[1]")
-  out_len[0] = max_len
-
-  local ckr = _M.driver.C_Sign(self._sessionHandle, cast_data_to_sign, data_to_sign_len, out_buf, out_len)
-  if not ckr or ckr ~= CKR_OK then
-    return err_out(ckr, "Signature failed: ")
-  end
-
-  return ffi.string(out_buf, out_len[0]), out_len
-
-end
-
-_M.sign_update = function (self, data_part_to_sign) 
-  if not _M.driver then
-    return nil, "Module not initialized"
-  end
-
-  if not self or not self._sessionPtr then
-    return nil, "Not valid session"
-  end
-
-  local data_part_to_sign_len = #data_part_to_sign
-  local cast_data_part_to_sign = ffi.cast ('CK_BYTE_PTR', data_part_to_sign)
-
-  local ckr = _M.driver.C_SignUpdate(self._sessionHandle, cast_data_part_to_sign, data_part_to_sign_len)
-  if not ckr or ckr ~= CKR_OK then
-    return err_out(ckr, "Signature update failed: ")
-  end
-
-  return true
-
-end
-
-_M.sign_final = function (self) 
-  if not _M.driver then
-    return nil, "Module not initialized"
-  end
-
-  if not self or not self._sessionPtr then
-    return nil, "Not valid session"
-  end
-
-  local max_len = 2048 
-  local out_buf = ffi.new("CK_BYTE[?]", max_len)
-  local out_len = ffi.new("CK_ULONG[1]")
-  out_len[0] = max_len
-
-  local ckr = _M.driver.C_SignFinal(self._sessionHandle, out_buf, out_len)
-  if not ckr or ckr ~= CKR_OK then
-    return err_out(ckr, "Signature failed: ")
-  end
-
-  return ffi.string(out_buf, out_len[0]), out_len
-
-end
-
-
-_M.verify_init = function (self, mechanism_type, h_key_ptr, mech_param, mech_param_size) 
-
-  if not _M.driver then
-    return nil, "Module not initialized"
-  end
-
-  if not self or not self._sessionPtr then
-    return nil, "Not valid session"
-  end
-
-  local mechanismPtr = ffi.new ( 'CK_MECHANISM[1]' )
-  mechanismPtr[0].mechanism = mechanism_type
-  mechanismPtr[0].pParameter = mech_param
-  mechanismPtr[0].ulParameterLen = mech_param_size or 0
-
-  local ckr = _M.driver.C_VerifyInit(self._sessionHandle, mechanismPtr, h_key_ptr[0] )
-  if not ckr or ckr ~= CKR_OK then
-    return err_out(ckr, "Verification initialization failed: ")
-  end
-
-  return true  
-end
 
 _M.verify = function (self, data_to_verify, signature_to_verify) 
   if not _M.driver then
@@ -1308,12 +1102,34 @@ _M.verify = function (self, data_to_verify, signature_to_verify)
   end
 
   local data_to_verify_len = #data_to_verify
-  local cast_data_to_verify = ffi.cast ('CK_BYTE_PTR', data_to_verify)
+  local cast_data_to_verify = ffi_cast ('CK_BYTE_PTR', data_to_verify)
 
   local signature_to_verify_len = #signature_to_verify
-  local cast_signature_to_verify = ffi.cast ('CK_BYTE_PTR', signature_to_verify)
+  local cast_signature_to_verify = ffi_cast ('CK_BYTE_PTR', signature_to_verify)
   
   local ckr = _M.driver.C_Verify(self._sessionHandle, cast_data_to_verify, data_to_verify_len, cast_signature_to_verify, signature_to_verify_len)
+  if not ckr or ckr ~= CKR_OK then
+    return err_out(ckr, "Verification failed: ")
+  end
+
+  return true
+
+end
+
+
+_M.verify_final = function (self, signature_to_verify) 
+  if not _M.driver then
+    return nil, "Module not initialized"
+  end
+
+  if not self or not self._sessionPtr then
+    return nil, "Not valid session"
+  end
+
+  local signature_to_verify_len = #signature_to_verify
+  local cast_signature_to_verify = ffi_cast ('CK_BYTE_PTR', signature_to_verify)
+  
+  local ckr = _M.driver.C_Verify(self._sessionHandle,  cast_signature_to_verify, signature_to_verify_len)
   if not ckr or ckr ~= CKR_OK then
     return err_out(ckr, "Verification failed: ")
   end
